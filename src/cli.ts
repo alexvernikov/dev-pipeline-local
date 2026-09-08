@@ -14,8 +14,7 @@ const command = process.argv[2];
 const url = (option("url") ?? process.env.DEV_PIPELINE_URL ?? "http://localhost:3000").replace(/\/$/, "");
 const directory = resolve(option("directory") ?? process.cwd());
 
-if (command !== "connect") throw new Error("Usage: dev-pipeline-local connect [--url=https://pipeline.example] [--directory=/path/to/project]");
-if (!url.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(url)) throw new Error("The pipeline URL must use HTTPS unless it is localhost.");
+const usage = "Usage: dev-pipeline-local connect [--url=https://pipeline.example] [--directory=/path/to/project]";
 
 async function request(path: string, body?: object, token?: string) {
   const response = await fetch(`${url}${path}`, {
@@ -72,6 +71,8 @@ async function verifySetup(token: string) {
 }
 
 async function run() {
+  if (command !== "connect") throw new Error(usage);
+  if (!url.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(url)) throw new Error("The pipeline URL must use HTTPS unless it is localhost.");
   const token = await pair();
   await verifySetup(token);
   console.log("Connected. Leave this terminal open while Dev Pipeline is working.");
