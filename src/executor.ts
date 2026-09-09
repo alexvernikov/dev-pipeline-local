@@ -43,14 +43,38 @@ async function command(cwd: string, value: string): Promise<CommandResult> {
 async function repositoryRoot(sourceDirectory: string, expectedRepository: string) {
   const source = await realpath(sourceDirectory);
   const root = (await git(source, ["rev-parse", "--show-toplevel"])).trim();
-  const remote = repositoryFromRemote(await git(root, ["remote", "get-url", "origin"]));
+  const remote = repositoryFromRemote(await git(root, ["config", "--get", "remote.origin.url"]));
   if (remote?.toLowerCase() !== expectedRepository.toLowerCase()) throw new Error(`The selected directory is not ${expectedRepository}.`);
-  await readFile(path.join(root, "package.json"), "utf8").then(JSON.parse).catch(() => { throw new Error("This connector currently supports repositories with a valid package.json."); });
   return root;
+}
+
+async function hasJavaScriptProject(root: string) {
+  try {
+    JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new Error("The repository has an invalid package.json.");
+  }
+}
+
+async function scaffoldJavaScriptProject(root: string, repository: string) {
+  const files = (await git(root, ["ls-files"])).split("\n").filter(Boolean);
+  const codeFiles = files.filter((file) => !file.startsWith("specs/") && !/^(?:README(?:\..*)?|LICENSE(?:\..*)?|\.gitignore|\.gitattributes)$/i.test(file));
+  if (codeFiles.length) throw new Error("This connector supports JavaScript projects with a valid package.json.");
+  if (await git(root, ["status", "--porcelain"])) throw new Error("Commit or discard local changes before initializing this project.");
+  const name = repository.split("/").at(-1)!.toLowerCase().replace(/[^a-z0-9._-]/g, "-");
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await writeFile(path.join(root, "package.json"), `${JSON.stringify({ name, private: true, type: "module", scripts: { test: "node --test", build: "node --check src/index.js" } }, null, 2)}\n`);
+  await writeFile(path.join(root, "src", "index.js"), "export {};\n");
+  await git(root, ["add", "package.json", "src/index.js"]);
+  await git(root, ["-c", "user.name=Dev Pipeline", "-c", "user.email=dev-pipeline@localhost", "commit", "-m", "chore: initialize JavaScript project"]);
+  await git(root, ["push", "origin", "HEAD"]);
 }
 
 export async function verifyLocalProject(sourceDirectory: string, setup: Setup) {
   const root = await repositoryRoot(sourceDirectory, setup.repository);
+  if (!await hasJavaScriptProject(root)) await scaffoldJavaScriptProject(root, setup.repository);
   if (setup.commands.setup) {
     const installation = await command(root, setup.commands.setup);
     if (installation.code) throw new Error("The setup command failed.");
