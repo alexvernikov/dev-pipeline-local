@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createInactivitySignal, dependencyInstallCommand, failedCommand, repairPrompt, repositoryFromRemote, requiresGreenBaseline, verificationCommand, verifyLocalProject } from "./executor.js";
+import { createInactivitySignal, dependencyInstallCommand, failedCommand, repairPrompt, repositoryFromRemote, requiresGreenBaseline, safeCodePath, verificationCommand, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -65,6 +65,12 @@ test("returns failed verification to the coding agent", () => {
   const prompt = repairPrompt({ code: 1, text: "TypeError: createApp is not a function" });
   assert.match(prompt, /continue working/i);
   assert.match(prompt, /createApp is not a function/);
+});
+
+test("allows an environment template but rejects actual secrets", () => {
+  assert.equal(safeCodePath(".env.example"), ".env.example");
+  assert.throws(() => safeCodePath(".env"), /outside the permitted repository context/);
+  assert.throws(() => safeCodePath("config/private.key"), /outside the permitted repository context/);
 });
 
 test("verifies a JavaScript project in the expected repository", async () => {

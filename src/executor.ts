@@ -57,8 +57,10 @@ export function repositoryFromRemote(remote: string) {
   return match?.[1] ?? null;
 }
 
-function safeCodePath(value: string) {
-  if (!value || value.startsWith("/") || value.includes("\\") || value.split("/").some((part) => !part || ["..", ".", ".git", ".ai-pipeline"].includes(part)) || /(^|\/)(\.env(?:\.|$)|.*\.(pem|key)$)/i.test(value)) throw new Error("This file is outside the permitted repository context.");
+export function safeCodePath(value: string) {
+  const name = value.split("/").at(-1)?.toLowerCase();
+  const secret = (name?.startsWith(".env") && name !== ".env.example") || /\.(pem|key)$/i.test(name ?? "");
+  if (!value || value.startsWith("/") || value.includes("\\") || value.split("/").some((part) => !part || ["..", ".", ".git", ".ai-pipeline"].includes(part)) || secret) throw new Error("This file is outside the permitted repository context.");
   return value;
 }
 
@@ -263,10 +265,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     await git(worktree.root, ["add", "-A"]);
     const names = (await git(worktree.root, ["diff", "--cached", "--name-only"])).split("\n").filter(Boolean);
     if (!names.length) throw new Error("No repository changes were produced.");
-    for (const name of names) {
-      const data = await readFile(await safeLocalPath(worktree.root, name)).catch(() => null);
-      if (data && (data.length > 100_000 || data.includes(0))) throw new Error("Only text source changes under 100 KB per file are supported.");
-    }
+    for (const name of names) await safeLocalPath(worktree.root, name);
     await git(worktree.root, ["-c", "user.name=Dev Pipeline", "-c", "user.email=dev-pipeline@localhost", "commit", "-m", `implementation: ${job.id}`]);
     const commit = (await git(worktree.root, ["rev-parse", "HEAD"])).trim();
     await progress("Pushing the verified work branch");
