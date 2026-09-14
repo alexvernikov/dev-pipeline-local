@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { generateText, NoOutputGeneratedError, Output, stepCountIs, tool } from "ai";
 import { z } from "zod";
-import { ImplementationChecks } from "./checks.js";
+import { CheckLog } from "./checks.js";
 import { languageModel } from "./providers.js";
 import { implementationSchema, reviewSchema, type AgentReport, type Job, type Result, type Setup } from "./protocol.js";
 
@@ -185,7 +185,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     if (baseline.code && requiresGreenBaseline(job)) throw new Error(failedCommand("The unchanged repository failed verification", baseline));
     if (baseline.code) await progress("Repairing the existing pipeline change");
     const readonly = job.execution === "review";
-    const checks = new ImplementationChecks(job.testPlan ?? "");
+    const checks = new CheckLog();
     let dependenciesChanged = false;
     const installDependencies = async () => {
       if (!dependenciesChanged) return;
@@ -215,13 +215,9 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => { await progress("Inspecting current changes"); return (await git(worktree.root, ["diff", "HEAD"])).slice(-100_000); } }),
       run_checks: tool({ description: "Run the configured test or verification command", inputSchema: z.object({ focused: z.boolean() }), execute: async ({ focused }) => runCheck(focused) }),
       ...(!readonly ? {
-        begin_behavior: tool({ description: "Start the next approved behaviour's test and implementation cycle", inputSchema: z.object({ behavior: z.string().min(1) }), execute: async ({ behavior }) => { await progress("Starting the next test-first behaviour"); checks.begin(behavior); return "Write its test, then run checks."; } }),
-        confirm_red: tool({ description: "Record why the observed assertion failure proves missing behaviour", inputSchema: z.object({ assertionExcerpt: z.string().min(1), reason: z.string().min(1) }), execute: async ({ assertionExcerpt, reason }) => { await progress("Confirming the intended test failure"); checks.confirmRed(assertionExcerpt, reason); return "Red assessment recorded."; } }),
-        use_existing_checks: tool({ description: "Cite the approved reason to use existing verification instead of TDD", inputSchema: z.object({ planExcerpt: z.string().min(1) }), execute: async ({ planExcerpt }) => { await progress("Applying the approved verification approach"); checks.useExistingChecks(planExcerpt); return "Exception recorded."; } }),
         write_file: tool({ description: "Write a changed text file and classify the edit", inputSchema: z.object({ path: z.string(), kind: z.enum(["test", "implementation", "refactor"]), content: z.string().max(100_000) }), execute: async ({ path: relative, kind, content }) => {
           await progress(`${kind === "test" ? "Writing test" : kind === "implementation" ? "Writing code" : "Refining code"}: ${relative}`);
           const filename = await safeLocalPath(worktree.root, relative);
-          checks.beforeWrite(kind);
           await mkdir(path.dirname(filename), { recursive: true });
           await writeFile(filename, content, "utf8");
           if (relative === "package.json") dependenciesChanged = true;

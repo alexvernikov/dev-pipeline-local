@@ -35,7 +35,6 @@ export const jobSchema = z.object({
   commands: z.object({ setup: z.string(), test: z.string(), verify: z.string() }),
   system: z.string().optional(),
   prompt: z.string().optional(),
-  testPlan: z.string().optional(),
 });
 
 export const resultSchema = z.discriminatedUnion("execution", [
