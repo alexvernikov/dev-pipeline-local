@@ -3,7 +3,7 @@ import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { generateText, Output, stepCountIs, tool } from "ai";
+import { generateText, NoOutputGeneratedError, Output, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { ImplementationChecks } from "./checks.js";
 import { languageModel } from "./providers.js";
@@ -35,6 +35,15 @@ export async function verificationCommand(root: string, configured: string) {
 
 export function requiresGreenBaseline(job: Pick<Job, "execution" | "baseCommit" | "headCommit">) {
   return job.execution === "implementation" && job.baseCommit === job.headCommit;
+}
+
+export function generatedOutput<T>(result: { readonly output: T }) {
+  try {
+    return result.output;
+  } catch (error) {
+    if (NoOutputGeneratedError.isInstance(error)) return undefined;
+    throw error;
+  }
 }
 
 export function createInactivitySignal(delay = 5 * 60 * 1000) {
@@ -223,18 +232,32 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     const schema: z.ZodType<AgentReport> = job.execution === "implementation" ? implementationSchema : reviewSchema;
     await progress(job.execution === "implementation" ? "Planning the first test-first change" : "Reviewing the implementation");
     const result = await generateText({ model: languageModel(job.ai), system: job.system, prompt: `${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}`, tools, stopWhen: stepCountIs(60), output: Output.object({ schema }), abortSignal: inactivity.signal });
-    if (result.output.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
+    let report = generatedOutput(result);
     await installDependencies();
     await progress("Running final verification");
+    const finalCommand = await verificationCommand(worktree.root, job.commands.verify);
     const verification = await verify();
-    checks.checked(await verificationCommand(worktree.root, job.commands.verify), verification);
+    checks.checked(finalCommand, verification);
     await progress(`Final verification ${verification.code === 0 ? "passed" : "failed"}`);
     if (verification.code) throw new Error(failedCommand("Full verification failed; the change was not published", verification));
+    const evidence = readonly ? "" : checks.finish();
+    if (!report) {
+      await progress("Preparing the verified implementation report");
+      const diff = (await git(worktree.root, ["diff", "HEAD"])).slice(-60_000);
+      const summary = await generateText({
+        model: languageModel(job.ai),
+        system: job.system,
+        prompt: `${job.prompt}\n\nThe repository work reached its tool limit, but the current change passed final verification. Return the required structured ${job.execution} report using only the evidence below. Do not propose or perform more repository work.\n\n# Current diff\n${diff}\n\n# Final verification\nCommand: ${finalCommand}\nExit: ${verification.code}\n${verification.text}\n\n${evidence ? `# Test-first evidence\n${evidence}` : ""}`,
+        output: Output.object({ schema }),
+        abortSignal: inactivity.signal,
+      });
+      report = summary.output;
+    }
+    if (report.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
     if (readonly) {
       if (await git(worktree.root, ["status", "--porcelain"])) throw new Error("Review changed the checkout.");
-      return { execution: "review", commit: job.headCommit, report: reviewSchema.parse(result.output), verification };
+      return { execution: "review", commit: job.headCommit, report: reviewSchema.parse(report), verification };
     }
-    const evidence = checks.finish();
     await progress("Preparing the verified commit");
     await git(worktree.root, ["add", "-A"]);
     const names = (await git(worktree.root, ["diff", "--cached", "--name-only"])).split("\n").filter(Boolean);
@@ -247,7 +270,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     const commit = (await git(worktree.root, ["rev-parse", "HEAD"])).trim();
     await progress("Pushing the verified work branch");
     await git(worktree.root, ["push", "origin", `HEAD:refs/heads/${job.branch}`]);
-    return { execution: "implementation", commit, report: implementationSchema.parse(result.output), evidence, verification };
+    return { execution: "implementation", commit, report: implementationSchema.parse(report), evidence, verification };
   } finally {
     inactivity.stop();
     await worktree.cleanup();

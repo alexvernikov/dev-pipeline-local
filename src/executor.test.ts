@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createInactivitySignal, dependencyInstallCommand, failedCommand, repositoryFromRemote, requiresGreenBaseline, verificationCommand, verifyLocalProject } from "./executor.js";
+import { NoOutputGeneratedError } from "ai";
+import { createInactivitySignal, dependencyInstallCommand, failedCommand, generatedOutput, repositoryFromRemote, requiresGreenBaseline, verificationCommand, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -59,6 +60,13 @@ test("only a first implementation requires a green starting branch", () => {
   assert.equal(requiresGreenBaseline({ execution: "implementation", baseCommit: "base", headCommit: "base" }), true);
   assert.equal(requiresGreenBaseline({ execution: "implementation", baseCommit: "base", headCommit: "pipeline-change" }), false);
   assert.equal(requiresGreenBaseline({ execution: "review", baseCommit: "base", headCommit: "pipeline-change" }), false);
+});
+
+test("recognises a tool run that ended before producing its report", () => {
+  const report = { kind: "implementation" as const };
+  assert.equal(generatedOutput({ output: report }), report);
+  assert.equal(generatedOutput({ get output(): typeof report { throw new NoOutputGeneratedError(); } }), undefined);
+  assert.throws(() => generatedOutput({ get output(): typeof report { throw new Error("provider failed"); } }), /provider failed/);
 });
 
 test("verifies a JavaScript project in the expected repository", async () => {
