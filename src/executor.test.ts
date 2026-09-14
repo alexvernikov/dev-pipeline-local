@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createInactivitySignal, dependencyInstallCommand, failedCommand, repositoryFromRemote, verificationCommand, verifyLocalProject } from "./executor.js";
+import { createInactivitySignal, dependencyInstallCommand, failedCommand, repositoryFromRemote, requiresGreenBaseline, verificationCommand, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -53,6 +53,12 @@ test("full verification includes checks declared by generated projects", async (
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("only a first implementation requires a green starting branch", () => {
+  assert.equal(requiresGreenBaseline({ execution: "implementation", baseCommit: "base", headCommit: "base" }), true);
+  assert.equal(requiresGreenBaseline({ execution: "implementation", baseCommit: "base", headCommit: "pipeline-change" }), false);
+  assert.equal(requiresGreenBaseline({ execution: "review", baseCommit: "base", headCommit: "pipeline-change" }), false);
 });
 
 test("verifies a JavaScript project in the expected repository", async () => {

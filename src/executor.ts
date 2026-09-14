@@ -33,6 +33,10 @@ export async function verificationCommand(root: string, configured: string) {
   return [configured, ...extras].join(" && ");
 }
 
+export function requiresGreenBaseline(job: Pick<Job, "execution" | "baseCommit" | "headCommit">) {
+  return job.execution === "implementation" && job.baseCommit === job.headCommit;
+}
+
 export function createInactivitySignal(delay = 5 * 60 * 1000) {
   const controller = new AbortController();
   let timer: NodeJS.Timeout;
@@ -169,7 +173,8 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     if (!job.ai || !job.execution || !job.system || !job.prompt) throw new Error("The repository job is incomplete.");
     await progress("Checking the unchanged project");
     const baseline = await verify();
-    if (job.execution === "implementation" && baseline.code) throw new Error("The unchanged repository must pass verification before implementation.");
+    if (baseline.code && requiresGreenBaseline(job)) throw new Error(failedCommand("The unchanged repository failed verification", baseline));
+    if (baseline.code) await progress("Repairing the existing pipeline change");
     const readonly = job.execution === "review";
     const checks = new ImplementationChecks(job.testPlan ?? "");
     let dependenciesChanged = false;
