@@ -164,7 +164,16 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     if (job.execution === "implementation" && baseline.code) throw new Error("The unchanged repository must pass verification before implementation.");
     const readonly = job.execution === "review";
     const checks = new ImplementationChecks(job.testPlan ?? "");
+    let dependenciesChanged = false;
+    const installDependencies = async () => {
+      if (!dependenciesChanged) return;
+      await progress("Installing changed dependencies");
+      const installation = await command(worktree.root, await dependencyInstallCommand(worktree.root));
+      if (installation.code) throw new Error(failedCommand("Dependency installation failed", installation));
+      dependenciesChanged = false;
+    };
     const runCheck = async (focused: boolean) => {
+      await installDependencies();
       await progress(focused ? "Running focused tests" : "Running full verification");
       const selected = focused ? job.commands.test || job.commands.verify : job.commands.verify;
       const result = await command(worktree.root, selected);
@@ -193,6 +202,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
           checks.beforeWrite(kind);
           await mkdir(path.dirname(filename), { recursive: true });
           await writeFile(filename, content, "utf8");
+          if (relative === "package.json") dependenciesChanged = true;
           return "Saved.";
         } }),
       } : {}),
@@ -201,12 +211,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     await progress(job.execution === "implementation" ? "Planning the first test-first change" : "Reviewing the implementation");
     const result = await generateText({ model: languageModel(job.ai), system: job.system, prompt: `${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}`, tools, stopWhen: stepCountIs(60), output: Output.object({ schema }), abortSignal: inactivity.signal });
     if (result.output.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
-    const changedFiles = (await git(worktree.root, ["diff", "--name-only", "HEAD"])).split("\n");
-    if (changedFiles.includes("package.json")) {
-      await progress("Installing changed dependencies");
-      const installation = await command(worktree.root, await dependencyInstallCommand(worktree.root));
-      if (installation.code) throw new Error(failedCommand("Dependency installation failed", installation));
-    }
+    await installDependencies();
     await progress("Running final verification");
     const verification = await verify();
     checks.checked(job.commands.verify, verification);
