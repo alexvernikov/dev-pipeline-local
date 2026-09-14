@@ -3,7 +3,7 @@ import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { generateText, NoOutputGeneratedError, Output, stepCountIs, tool } from "ai";
+import { generateText, Output, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { CheckLog } from "./checks.js";
 import { languageModel } from "./providers.js";
@@ -17,6 +17,10 @@ export function failedCommand(label: string, result: CommandResult) {
   const prefix = `${label} (exit ${result.code}).`;
   const available = 500 - prefix.length - 2;
   return result.text.trim() ? `${prefix}\n\n${result.text.trim().slice(-available)}` : prefix;
+}
+
+export function repairPrompt(result: CommandResult) {
+  return `Continue working on the current repository change. Full project verification failed with exit ${result.code}. Inspect and fix the cause, then run the checks again before finishing.\n\n${result.text}`;
 }
 
 export async function dependencyInstallCommand(root: string) {
@@ -35,15 +39,6 @@ export async function verificationCommand(root: string, configured: string) {
 
 export function requiresGreenBaseline(job: Pick<Job, "execution" | "baseCommit" | "headCommit">) {
   return job.execution === "implementation" && job.baseCommit === job.headCommit;
-}
-
-export function generatedOutput<T>(result: { readonly output: T }) {
-  try {
-    return result.output;
-  } catch (error) {
-    if (NoOutputGeneratedError.isInstance(error)) return undefined;
-    throw error;
-  }
 }
 
 export function createInactivitySignal(delay = 5 * 60 * 1000) {
@@ -180,6 +175,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       return { execution: "merge", commit: job.headCommit, verification };
     }
     if (!job.ai || !job.execution || !job.system || !job.prompt) throw new Error("The repository job is incomplete.");
+    const ai = job.ai;
     await progress("Checking the unchanged project");
     const baseline = await verify();
     if (baseline.code && requiresGreenBaseline(job)) throw new Error(failedCommand("The unchanged repository failed verification", baseline));
@@ -227,28 +223,37 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     };
     const schema: z.ZodType<AgentReport> = job.execution === "implementation" ? implementationSchema : reviewSchema;
     await progress(job.execution === "implementation" ? "Planning the first test-first change" : "Reviewing the implementation");
-    const result = await generateText({ model: languageModel(job.ai), system: job.system, prompt: `${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}`, tools, stopWhen: stepCountIs(60), output: Output.object({ schema }), abortSignal: inactivity.signal });
-    let report = generatedOutput(result);
-    await installDependencies();
-    await progress("Running final verification");
-    const finalCommand = await verificationCommand(worktree.root, job.commands.verify);
-    const verification = await verify();
-    checks.checked(finalCommand, verification);
-    await progress(`Final verification ${verification.code === 0 ? "passed" : "failed"}`);
-    if (verification.code) throw new Error(failedCommand("Full verification failed; the change was not published", verification));
-    const evidence = readonly ? "" : checks.finish();
-    if (!report) {
-      await progress("Preparing the verified implementation report");
+    const work = async (prompt: string) => generateText({ model: languageModel(ai), system: job.system, prompt, tools, stopWhen: stepCountIs(60), abortSignal: inactivity.signal });
+    let agentNotes = (await work(`${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}\n\nWork on the repository with the available tools. Do not prepare the final report yet.`)).text;
+    let finalCommand = "";
+    let verification: CommandResult = baseline;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await installDependencies();
+      await progress(attempt ? "Re-running full verification" : "Running final verification");
+      finalCommand = await verificationCommand(worktree.root, job.commands.verify);
+      verification = await command(worktree.root, finalCommand);
+      checks.checked(finalCommand, verification);
+      await progress(`Final verification ${verification.code === 0 ? "passed" : "failed"}`);
+      if (!verification.code) break;
+      if (readonly || attempt === 2) throw new Error(failedCommand("Full verification failed; the change was not published", verification));
+      await progress("Repairing the failed verification");
       const diff = (await git(worktree.root, ["diff", "HEAD"])).slice(-60_000);
-      const summary = await generateText({
-        model: languageModel(job.ai),
-        system: job.system,
-        prompt: `${job.prompt}\n\nThe repository work reached its tool limit, but the current change passed final verification. Return the required structured ${job.execution} report using only the evidence below. Do not propose or perform more repository work.\n\n# Current diff\n${diff}\n\n# Final verification\nCommand: ${finalCommand}\nExit: ${verification.code}\n${verification.text}\n\n${evidence ? `# Test-first evidence\n${evidence}` : ""}`,
-        output: Output.object({ schema }),
-        abortSignal: inactivity.signal,
-      });
-      report = summary.output;
+      const repair = await work(`${job.prompt}\n\n${repairPrompt(verification)}\n\n# Current change\n${diff}`);
+      agentNotes = `${agentNotes}\n\n${repair.text}`.slice(-20_000);
     }
+    const evidence = readonly ? "" : checks.finish();
+    await progress("Preparing the verified report");
+    const diff = readonly
+      ? (await git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"])).slice(-60_000)
+      : (await git(worktree.root, ["diff", "HEAD"])).slice(-60_000);
+    const summary = await generateText({
+      model: languageModel(ai),
+      system: job.system,
+      prompt: `${job.prompt}\n\nThe repository work is complete and final verification passed. Return only the required structured ${job.execution} report from the evidence below. Do not perform more repository work.\n\n# Agent notes\n${agentNotes}\n\n# Change\n${diff}\n\n# Final verification\nCommand: ${finalCommand}\nExit: ${verification.code}\n${verification.text}\n\n${evidence ? `# Check evidence\n${evidence}` : ""}`,
+      output: Output.object({ schema }),
+      abortSignal: inactivity.signal,
+    });
+    const report = summary.output;
     if (report.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
     if (readonly) {
       if (await git(worktree.root, ["status", "--porcelain"])) throw new Error("Review changed the checkout.");
