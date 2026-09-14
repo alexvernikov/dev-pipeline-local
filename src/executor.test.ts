@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createInactivitySignal, dependencyInstallCommand, failedCommand, repositoryFromRemote, verifyLocalProject } from "./executor.js";
+import { createInactivitySignal, dependencyInstallCommand, failedCommand, repositoryFromRemote, verificationCommand, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -43,6 +43,16 @@ test("failed commands retain concise verification evidence", () => {
   assert.match(message, /exit 127/);
   assert.match(message, /vitest: command not found/);
   assert.ok(message.length <= 500);
+});
+
+test("full verification includes checks declared by generated projects", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
+  try {
+    await writeFile(path.join(directory, "package.json"), JSON.stringify({ scripts: { test: "node --test", build: "tsc", typecheck: "tsc --noEmit", "test:integration": "vitest run" } }));
+    assert.equal(await verificationCommand(directory, "npm test && npm run build"), "npm test && npm run build && npm run typecheck && npm run test:integration");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("verifies a JavaScript project in the expected repository", async () => {

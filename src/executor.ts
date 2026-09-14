@@ -25,6 +25,14 @@ export async function dependencyInstallCommand(root: string) {
   return ["npm", "pnpm", "yarn", "bun"].includes(manager) ? `${manager} install` : "npm install";
 }
 
+export async function verificationCommand(root: string, configured: string) {
+  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as { scripts?: Record<string, unknown> };
+  const extras = ["typecheck", "test:integration"]
+    .filter((name) => typeof manifest.scripts?.[name] === "string" && !configured.includes(`run ${name}`))
+    .map((name) => `npm run ${name}`);
+  return [configured, ...extras].join(" && ");
+}
+
 export function createInactivitySignal(delay = 5 * 60 * 1000) {
   const controller = new AbortController();
   let timer: NodeJS.Timeout;
@@ -102,7 +110,7 @@ export async function verifyLocalProject(sourceDirectory: string, setup: Setup) 
     const installation = await command(root, setup.commands.setup);
     if (installation.code) throw new Error("The setup command failed.");
   }
-  const verification = await command(root, setup.commands.verify);
+  const verification = await command(root, await verificationCommand(root, setup.commands.verify));
   if (verification.code) throw new Error("The verification command failed.");
   return verification;
 }
@@ -150,7 +158,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       const setup = await command(worktree.root, job.commands.setup);
       if (setup.code) throw new Error("The configured setup command failed.");
     }
-    const verify = () => command(worktree.root, job.commands.verify);
+    const verify = async () => command(worktree.root, await verificationCommand(worktree.root, job.commands.verify));
     if (job.action === "merge") {
       await progress("Running full verification before merge");
       const verification = await verify();
@@ -175,7 +183,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     const runCheck = async (focused: boolean) => {
       await installDependencies();
       await progress(focused ? "Running focused tests" : "Running full verification");
-      const selected = focused ? job.commands.test || job.commands.verify : job.commands.verify;
+      const selected = focused && job.commands.test ? job.commands.test : await verificationCommand(worktree.root, job.commands.verify);
       const result = await command(worktree.root, selected);
       checks.checked(selected, result);
       await progress(`${focused ? "Focused tests" : "Full verification"} ${result.code === 0 ? "passed" : "failed"}`);
@@ -214,7 +222,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     await installDependencies();
     await progress("Running final verification");
     const verification = await verify();
-    checks.checked(job.commands.verify, verification);
+    checks.checked(await verificationCommand(worktree.root, job.commands.verify), verification);
     await progress(`Final verification ${verification.code === 0 ? "passed" : "failed"}`);
     if (verification.code) throw new Error(failedCommand("Full verification failed; the change was not published", verification));
     if (readonly) {
