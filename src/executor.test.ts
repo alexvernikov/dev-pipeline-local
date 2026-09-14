@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createInactivitySignal, repositoryFromRemote, verifyLocalProject } from "./executor.js";
+import { createInactivitySignal, dependencyInstallCommand, failedCommand, repositoryFromRemote, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -24,6 +24,25 @@ test("activity extends execution while inactivity aborts it", async () => {
   await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(timeout.signal.aborted, true);
   timeout.stop();
+});
+
+test("selects the repository package manager for changed dependencies", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
+  try {
+    await writeFile(path.join(directory, "package.json"), '{"packageManager":"pnpm@10.0.0"}\n');
+    assert.equal(await dependencyInstallCommand(directory), "pnpm install");
+    await writeFile(path.join(directory, "package.json"), "{}\n");
+    assert.equal(await dependencyInstallCommand(directory), "npm install");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed commands retain concise verification evidence", () => {
+  const message = failedCommand("Full verification failed", { code: 127, text: "sh: vitest: command not found" });
+  assert.match(message, /exit 127/);
+  assert.match(message, /vitest: command not found/);
+  assert.ok(message.length <= 500);
 });
 
 test("verifies a JavaScript project in the expected repository", async () => {

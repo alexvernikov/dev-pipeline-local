@@ -13,6 +13,18 @@ const exec = promisify(execCallback);
 const execFile = promisify(execFileCallback);
 type CommandResult = { code: number; text: string };
 
+export function failedCommand(label: string, result: CommandResult) {
+  const prefix = `${label} (exit ${result.code}).`;
+  const available = 500 - prefix.length - 2;
+  return result.text.trim() ? `${prefix}\n\n${result.text.trim().slice(-available)}` : prefix;
+}
+
+export async function dependencyInstallCommand(root: string) {
+  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as { packageManager?: unknown };
+  const manager = typeof manifest.packageManager === "string" ? manifest.packageManager.split("@")[0] : "npm";
+  return ["npm", "pnpm", "yarn", "bun"].includes(manager) ? `${manager} install` : "npm install";
+}
+
 export function createInactivitySignal(delay = 5 * 60 * 1000) {
   const controller = new AbortController();
   let timer: NodeJS.Timeout;
@@ -189,10 +201,17 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     await progress(job.execution === "implementation" ? "Planning the first test-first change" : "Reviewing the implementation");
     const result = await generateText({ model: languageModel(job.ai), system: job.system, prompt: `${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}`, tools, stopWhen: stepCountIs(60), output: Output.object({ schema }), abortSignal: inactivity.signal });
     if (result.output.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
+    const changedFiles = (await git(worktree.root, ["diff", "--name-only", "HEAD"])).split("\n");
+    if (changedFiles.includes("package.json")) {
+      await progress("Installing changed dependencies");
+      const installation = await command(worktree.root, await dependencyInstallCommand(worktree.root));
+      if (installation.code) throw new Error(failedCommand("Dependency installation failed", installation));
+    }
     await progress("Running final verification");
     const verification = await verify();
     checks.checked(job.commands.verify, verification);
-    if (verification.code) throw new Error("Full verification failed. The change was not published.");
+    await progress(`Final verification ${verification.code === 0 ? "passed" : "failed"}`);
+    if (verification.code) throw new Error(failedCommand("Full verification failed; the change was not published", verification));
     if (readonly) {
       if (await git(worktree.root, ["status", "--porcelain"])) throw new Error("Review changed the checkout.");
       return { execution: "review", commit: job.headCommit, report: reviewSchema.parse(result.output), verification };
