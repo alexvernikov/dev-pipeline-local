@@ -10,7 +10,7 @@ export class ImplementationChecks {
   private exception = false;
   private evidence: string[] = [];
 
-  constructor(private readonly approvedPlan: string) {}
+  constructor(private readonly approvedVerification: string) {}
 
   begin(behavior: string) {
     if (this.exception || (this.behavior && !this.green)) throw new Error("Finish the current verification approach before starting another behaviour.");
@@ -22,7 +22,7 @@ export class ImplementationChecks {
 
   useExistingChecks(planExcerpt: string) {
     if (this.behavior || this.exception) throw new Error("Choose the verification approach before changing files.");
-    if (!planExcerpt.trim() || !this.approvedPlan.includes(planExcerpt)) throw new Error("Cite the approved test plan's reason for using existing checks instead of new behaviour tests.");
+    if (!planExcerpt.trim() || !this.approvedVerification.includes(planExcerpt)) throw new Error("Cite the approved work unit's reason for using existing checks instead of new behaviour tests.");
     this.exception = true;
     this.evidence.push(`Existing-checks exception, cited by the implementer for human review:\n${planExcerpt}`);
   }
@@ -56,7 +56,7 @@ export class ImplementationChecks {
   }
 
   finish() {
-    if (!this.green || (!this.red && !this.exception)) throw new Error("Complete the current behaviour through green, or use the approved existing-checks approach.");
+    if (!this.green || (!this.red && !this.exception)) throw new Error("Implementation stopped before the agent completed a test-first behaviour. No code was committed. Retry the attempt; if it fails again, revise the work unit into a smaller outcome.");
     return this.evidence.join("\n\n");
   }
 }

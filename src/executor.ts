@@ -13,6 +13,17 @@ const exec = promisify(execCallback);
 const execFile = promisify(execFileCallback);
 type CommandResult = { code: number; text: string };
 
+export function createInactivitySignal(delay = 5 * 60 * 1000) {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout;
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), delay);
+  };
+  touch();
+  return { signal: controller.signal, touch, stop: () => clearTimeout(timer) };
+}
+
 export function repositoryFromRemote(remote: string) {
   const match = remote.trim().match(/^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+\/[\w.-]+?)(?:\.git)?$/i);
   return match?.[1] ?? null;
@@ -116,49 +127,56 @@ async function checkout(sourceDirectory: string, job: Job) {
   } };
 }
 
-export async function executeJob(job: Job, sourceDirectory: string, heartbeat: () => Promise<void>): Promise<Result> {
+export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (progress: string) => Promise<void>): Promise<Result> {
+  await heartbeat("Preparing the local checkout");
   const worktree = await checkout(sourceDirectory, job);
+  const inactivity = createInactivitySignal();
+  const progress = async (message: string) => { inactivity.touch(); await heartbeat(message); };
   try {
     if (job.commands.setup) {
+      await progress("Installing project dependencies");
       const setup = await command(worktree.root, job.commands.setup);
       if (setup.code) throw new Error("The configured setup command failed.");
     }
     const verify = () => command(worktree.root, job.commands.verify);
     if (job.action === "merge") {
+      await progress("Running full verification before merge");
       const verification = await verify();
       if (verification.code) throw new Error("Full verification failed. The reviewed change was not merged.");
       if (await git(worktree.root, ["status", "--porcelain"])) throw new Error("Setup or verification changed the checkout.");
       return { execution: "merge", commit: job.headCommit, verification };
     }
     if (!job.ai || !job.execution || !job.system || !job.prompt) throw new Error("The repository job is incomplete.");
+    await progress("Checking the unchanged project");
     const baseline = await verify();
     if (job.execution === "implementation" && baseline.code) throw new Error("The unchanged repository must pass verification before implementation.");
     const readonly = job.execution === "review";
     const checks = new ImplementationChecks(job.testPlan ?? "");
     const runCheck = async (focused: boolean) => {
-      await heartbeat();
+      await progress(focused ? "Running focused tests" : "Running full verification");
       const selected = focused ? job.commands.test || job.commands.verify : job.commands.verify;
       const result = await command(worktree.root, selected);
       checks.checked(selected, result);
+      await progress(`${focused ? "Focused tests" : "Full verification"} ${result.code === 0 ? "passed" : "failed"}`);
       return result;
     };
     const tools = {
-      delivery_diff: tool({ description: "Inspect committed application changes from the work unit base to its current head", inputSchema: z.object({}), execute: async () => (await git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"])).slice(-100_000) }),
-      list_files: tool({ description: "List repository files", inputSchema: z.object({}), execute: async () => (await git(worktree.root, ["ls-files"])).split("\n").filter((file) => { try { safeCodePath(file); return !file.startsWith("specs/"); } catch { return false; } }).slice(0, 2000).join("\n") }),
+      delivery_diff: tool({ description: "Inspect committed application changes from the work unit base to its current head", inputSchema: z.object({}), execute: async () => { await progress("Inspecting the committed change"); return (await git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"])).slice(-100_000); } }),
+      list_files: tool({ description: "List repository files", inputSchema: z.object({}), execute: async () => { await progress("Listing repository files"); return (await git(worktree.root, ["ls-files"])).split("\n").filter((file) => { try { safeCodePath(file); return !file.startsWith("specs/"); } catch { return false; } }).slice(0, 2000).join("\n"); } }),
       read_file: tool({ description: "Read a relevant text file", inputSchema: z.object({ path: z.string() }), execute: async ({ path: relative }) => {
-        await heartbeat();
+        await progress(`Reading ${relative}`);
         const data = await readFile(await safeLocalPath(worktree.root, relative));
         if (data.length > 100_000 || data.includes(0)) throw new Error("Read text files under 100 KB.");
         return data.toString("utf8");
       } }),
-      diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => (await git(worktree.root, ["diff", "HEAD"])).slice(-100_000) }),
+      diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => { await progress("Inspecting current changes"); return (await git(worktree.root, ["diff", "HEAD"])).slice(-100_000); } }),
       run_checks: tool({ description: "Run the configured test or verification command", inputSchema: z.object({ focused: z.boolean() }), execute: async ({ focused }) => runCheck(focused) }),
       ...(!readonly ? {
-        begin_behavior: tool({ description: "Start the next approved behaviour's test and implementation cycle", inputSchema: z.object({ behavior: z.string().min(1) }), execute: async ({ behavior }) => { checks.begin(behavior); return "Write its test, then run checks."; } }),
-        confirm_red: tool({ description: "Record why the observed assertion failure proves missing behaviour", inputSchema: z.object({ assertionExcerpt: z.string().min(1), reason: z.string().min(1) }), execute: async ({ assertionExcerpt, reason }) => { checks.confirmRed(assertionExcerpt, reason); return "Red assessment recorded."; } }),
-        use_existing_checks: tool({ description: "Cite the approved reason to use existing verification instead of TDD", inputSchema: z.object({ planExcerpt: z.string().min(1) }), execute: async ({ planExcerpt }) => { checks.useExistingChecks(planExcerpt); return "Exception recorded."; } }),
+        begin_behavior: tool({ description: "Start the next approved behaviour's test and implementation cycle", inputSchema: z.object({ behavior: z.string().min(1) }), execute: async ({ behavior }) => { await progress("Starting the next test-first behaviour"); checks.begin(behavior); return "Write its test, then run checks."; } }),
+        confirm_red: tool({ description: "Record why the observed assertion failure proves missing behaviour", inputSchema: z.object({ assertionExcerpt: z.string().min(1), reason: z.string().min(1) }), execute: async ({ assertionExcerpt, reason }) => { await progress("Confirming the intended test failure"); checks.confirmRed(assertionExcerpt, reason); return "Red assessment recorded."; } }),
+        use_existing_checks: tool({ description: "Cite the approved reason to use existing verification instead of TDD", inputSchema: z.object({ planExcerpt: z.string().min(1) }), execute: async ({ planExcerpt }) => { await progress("Applying the approved verification approach"); checks.useExistingChecks(planExcerpt); return "Exception recorded."; } }),
         write_file: tool({ description: "Write a changed text file and classify the edit", inputSchema: z.object({ path: z.string(), kind: z.enum(["test", "implementation", "refactor"]), content: z.string().max(100_000) }), execute: async ({ path: relative, kind, content }) => {
-          await heartbeat();
+          await progress(`${kind === "test" ? "Writing test" : kind === "implementation" ? "Writing code" : "Refining code"}: ${relative}`);
           const filename = await safeLocalPath(worktree.root, relative);
           checks.beforeWrite(kind);
           await mkdir(path.dirname(filename), { recursive: true });
@@ -168,8 +186,10 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       } : {}),
     };
     const schema: z.ZodType<AgentReport> = job.execution === "implementation" ? implementationSchema : reviewSchema;
-    const result = await generateText({ model: languageModel(job.ai), system: job.system, prompt: `${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}`, tools, stopWhen: stepCountIs(60), output: Output.object({ schema }), abortSignal: AbortSignal.timeout(240_000) });
+    await progress(job.execution === "implementation" ? "Planning the first test-first change" : "Reviewing the implementation");
+    const result = await generateText({ model: languageModel(job.ai), system: job.system, prompt: `${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}`, tools, stopWhen: stepCountIs(60), output: Output.object({ schema }), abortSignal: inactivity.signal });
     if (result.output.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
+    await progress("Running final verification");
     const verification = await verify();
     checks.checked(job.commands.verify, verification);
     if (verification.code) throw new Error("Full verification failed. The change was not published.");
@@ -178,6 +198,7 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       return { execution: "review", commit: job.headCommit, report: reviewSchema.parse(result.output), verification };
     }
     const evidence = checks.finish();
+    await progress("Preparing the verified commit");
     await git(worktree.root, ["add", "-A"]);
     const names = (await git(worktree.root, ["diff", "--cached", "--name-only"])).split("\n").filter(Boolean);
     if (!names.length) throw new Error("No repository changes were produced.");
@@ -187,10 +208,11 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     }
     await git(worktree.root, ["-c", "user.name=Dev Pipeline", "-c", "user.email=dev-pipeline@localhost", "commit", "-m", `implementation: ${job.id}`]);
     const commit = (await git(worktree.root, ["rev-parse", "HEAD"])).trim();
-    await heartbeat();
+    await progress("Pushing the verified work branch");
     await git(worktree.root, ["push", "origin", `HEAD:refs/heads/${job.branch}`]);
     return { execution: "implementation", commit, report: implementationSchema.parse(result.output), evidence, verification };
   } finally {
+    inactivity.stop();
     await worktree.cleanup();
   }
 }

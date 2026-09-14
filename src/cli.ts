@@ -89,13 +89,20 @@ async function run() {
     if (!next.response.ok) throw new Error(next.data?.error ?? `Connection failed (${next.response.status}).`);
     const job = jobSchema.parse(next.data);
     console.log(`Working on ${job.branch}…`);
+    let progress = "Preparing the local checkout";
+    const pulse = setInterval(() => void report(token, { action: "heartbeat", jobId: job.id, progress }).catch(() => {}), 15_000);
     try {
-      const result: Result = await executeJob(job, directory, () => report(token, { action: "heartbeat", jobId: job.id }));
+      const result: Result = await executeJob(job, directory, (message) => {
+        progress = message;
+        return report(token, { action: "heartbeat", jobId: job.id, progress });
+      });
       await report(token, { action: "completed", jobId: job.id, result });
       console.log(`Finished ${job.branch} at ${result.commit.slice(0, 8)}.`);
     } catch (error) {
       console.error(error);
       await report(token, { action: "failed", jobId: job.id, error: safeFailure(error) });
+    } finally {
+      clearInterval(pulse);
     }
   }
 }

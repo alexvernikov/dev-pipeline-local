@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { repositoryFromRemote, verifyLocalProject } from "./executor.js";
+import { createInactivitySignal, repositoryFromRemote, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -13,6 +13,17 @@ test("recognises GitHub repository remotes", () => {
   assert.equal(repositoryFromRemote("git@github.com:alexvernikov/example.git"), "alexvernikov/example");
   assert.equal(repositoryFromRemote("https://github.com/alexvernikov/example.git"), "alexvernikov/example");
   assert.equal(repositoryFromRemote("https://example.com/alexvernikov/example.git"), null);
+});
+
+test("activity extends execution while inactivity aborts it", async () => {
+  const timeout = createInactivitySignal(40);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  timeout.touch();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(timeout.signal.aborted, false);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(timeout.signal.aborted, true);
+  timeout.stop();
 });
 
 test("verifies a JavaScript project in the expected repository", async () => {
