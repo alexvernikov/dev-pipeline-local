@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { generateText, hasToolCall, Output, tool } from "ai";
+import { generateText, hasToolCall, Output, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { CheckLog } from "./checks.js";
 import { languageModel } from "./providers.js";
@@ -60,17 +60,30 @@ function command(cwd: string, value: string, signal?: AbortSignal) {
   return run(cwd, value, [], signal, true);
 }
 
-async function dependencyCommand(root: string, configured: string) {
-  if (configured.trim()) return configured;
-  for (const [file, command] of [
-    ["pnpm-lock.yaml", "pnpm install"],
-    ["yarn.lock", "yarn install"],
-    ["bun.lock", "bun install"],
-    ["bun.lockb", "bun install"],
+async function packageManager(root: string) {
+  for (const [file, manager] of [
+    ["pnpm-lock.yaml", "pnpm"],
+    ["yarn.lock", "yarn"],
+    ["bun.lock", "bun"],
+    ["bun.lockb", "bun"],
   ]) {
-    if (await lstat(path.join(root, file)).then(() => true, () => false)) return command;
+    if (await lstat(path.join(root, file)).then(() => true, () => false)) return manager;
   }
-  return "npm install";
+  return "npm";
+}
+
+async function dependencyCommand(root: string, configured: string) {
+  return configured.trim() || `${await packageManager(root)} install`;
+}
+
+export async function runProjectScript(root: string, name: string, signal?: AbortSignal) {
+  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+  if (!manifest.scripts?.[name]) throw new Error(`The project script "${name}" is not defined.`);
+  return run(root, await packageManager(root), ["run", name], signal);
+}
+
+export function initialWorkPrompt(prompt: string, baseline: CommandResult) {
+  return `${prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}\n\nWork on the repository with the available tools. Run every relevant declared project script. When the repository work is complete, call finish_work with status ready. If work genuinely cannot continue without human direction, call finish_work with status blocked and explain why. The connector prepares the report after that call; do not write the report yourself.`;
 }
 
 async function repositoryRoot(sourceDirectory: string, expectedRepository: string) {
@@ -215,6 +228,13 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       } }),
       diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => { await progress("Inspecting current changes"); return git(worktree.root, ["diff", "HEAD"], signal); } }),
       run_checks: tool({ description: "Run the configured test or verification command", inputSchema: z.object({ focused: z.boolean() }), execute: async ({ focused }) => runCheck(focused) }),
+      run_project_script: tool({ description: "Run any script declared in package.json, such as an integration test or migration check", inputSchema: z.object({ name: z.string() }), execute: async ({ name }) => {
+        await progress(`Running ${name}`);
+        const result = await runProjectScript(worktree.root, name, signal);
+        checks.checked(`${await packageManager(worktree.root)} run ${name}`, result);
+        await progress(`${name} ${result.code === 0 ? "passed" : "failed"}`);
+        return result;
+      } }),
       run_setup: tool({ description: "Run the project's configured setup command after changing dependencies", inputSchema: z.object({}), execute: async () => {
         await progress("Installing project dependencies");
         const result = await command(worktree.root, await dependencyCommand(worktree.root, job.commands.setup), signal);
@@ -254,13 +274,13 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       blocker = undefined;
       const response = await generateText({
         model: languageModel(ai), system: job.system, prompt, tools,
-        stopWhen: hasToolCall("finish_work"), abortSignal: signal,
-        onStepFinish: async ({ text }) => { if (text.trim()) await progress("Agent response", text.trim()); },
+        stopWhen: [hasToolCall("finish_work"), stepCountIs(40)], abortSignal: signal,
+        onStepFinish: async ({ text }) => { if (text.trim()) await progress("Working through the implementation", text.trim()); },
       });
       if (blocker) throw new Error(blocker);
       return response;
     };
-    let agentNotes = (await work(`${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}\n\nWork on the repository with the available tools. Do not prepare the final report yet.`)).text;
+    let agentNotes = (await work(initialWorkPrompt(job.prompt, baseline))).text;
     let finalCommand = "";
     let verification: CommandResult = baseline;
     for (;;) {

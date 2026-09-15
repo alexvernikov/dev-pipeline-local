@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { failedCommand, preserveChanges, repairPrompt, repositoryFromRemote, requiresGreenBaseline, safeCodePath, verifyLocalProject } from "./executor.js";
+import { failedCommand, initialWorkPrompt, preserveChanges, repairPrompt, repositoryFromRemote, requiresGreenBaseline, runProjectScript, safeCodePath, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -33,6 +33,26 @@ test("returns failed verification to the coding agent", () => {
   const prompt = repairPrompt({ code: 1, text: "TypeError: createApp is not a function" });
   assert.match(prompt, /continue working/i);
   assert.match(prompt, /createApp is not a function/);
+});
+
+test("tells the coding agent to finish repository work before reporting", () => {
+  const prompt = initialWorkPrompt("Implement the work unit", { code: 0, text: "Tests passed" });
+  assert.match(prompt, /call finish_work with status ready/i);
+  assert.match(prompt, /connector prepares the report/i);
+  assert.doesNotMatch(prompt, /do not prepare the final report yet/i);
+});
+
+test("runs a declared project script", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
+  try {
+    await writeFile(path.join(directory, "package.json"), `${JSON.stringify({ scripts: { "test:integration": "node -e \"process.stdout.write('integration passed')\"" } })}\n`);
+    const result = await runProjectScript(directory, "test:integration");
+    assert.equal(result.code, 0);
+    assert.match(result.text, /integration passed/);
+    await assert.rejects(() => runProjectScript(directory, "missing"), /not defined/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("allows an environment template but rejects actual secrets", () => {
