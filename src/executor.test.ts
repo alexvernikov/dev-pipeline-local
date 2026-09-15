@@ -57,6 +57,26 @@ test("verifies a JavaScript project in the expected repository", async () => {
   }
 });
 
+test("installs npm dependencies when no setup command is configured", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
+  try {
+    await execFile("git", ["init"], { cwd: directory });
+    await execFile("git", ["remote", "add", "origin", "git@github.com:alexvernikov/example.git"], { cwd: directory });
+    await writeFile(path.join(directory, "package.json"), `${JSON.stringify({ scripts: { preinstall: "node -e \"require('fs').writeFileSync('installed.marker', 'yes')\"" } })}\n`);
+    await execFile("git", ["add", "."], { cwd: directory });
+    await execFile("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: directory });
+
+    const result = await verifyLocalProject(directory, {
+      repository: "alexvernikov/example",
+      commands: { setup: "", verify: "node -e \"if (!require('fs').existsSync('installed.marker')) process.exit(1)\"" },
+    });
+
+    assert.equal(result.code, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("project readiness commands cannot dirty the selected checkout", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
   try {

@@ -60,6 +60,19 @@ function command(cwd: string, value: string, signal?: AbortSignal) {
   return run(cwd, value, [], signal, true);
 }
 
+async function dependencyCommand(root: string, configured: string) {
+  if (configured.trim()) return configured;
+  for (const [file, command] of [
+    ["pnpm-lock.yaml", "pnpm install"],
+    ["yarn.lock", "yarn install"],
+    ["bun.lock", "bun install"],
+    ["bun.lockb", "bun install"],
+  ]) {
+    if (await lstat(path.join(root, file)).then(() => true, () => false)) return command;
+  }
+  return "npm install";
+}
+
 async function repositoryRoot(sourceDirectory: string, expectedRepository: string) {
   const source = await realpath(sourceDirectory);
   const root = (await git(source, ["rev-parse", "--show-toplevel"])).trim();
@@ -99,10 +112,8 @@ export async function verifyLocalProject(sourceDirectory: string, setup: Setup) 
   const workspace = path.join(temporary, "repository");
   await git(root, ["worktree", "add", "--detach", workspace, "HEAD"]);
   try {
-    if (setup.commands.setup) {
-      const installation = await command(workspace, setup.commands.setup);
-      if (installation.code) throw new Error(failedCommand("The setup command failed", installation));
-    }
+    const installation = await command(workspace, await dependencyCommand(workspace, setup.commands.setup));
+    if (installation.code) throw new Error(failedCommand("The setup command failed", installation));
     const verification = await command(workspace, setup.commands.verify);
     if (verification.code) throw new Error(failedCommand("The verification command failed", verification));
     return verification;
@@ -165,11 +176,9 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
   const progress = (message: string, activity?: string) => heartbeat(message, activity);
   let removeWorktree = true;
   try {
-    if (job.commands.setup) {
-      await progress("Installing project dependencies");
-      const setup = await command(worktree.root, job.commands.setup, signal);
-      if (setup.code) throw new Error(failedCommand("The configured setup command failed", setup));
-    }
+    await progress("Installing project dependencies");
+    const setup = await command(worktree.root, await dependencyCommand(worktree.root, job.commands.setup), signal);
+    if (setup.code) throw new Error(failedCommand("The setup command failed", setup));
     const verify = () => command(worktree.root, job.commands.verify, signal);
     if (job.action === "merge") {
       await progress("Running full verification before merge");
@@ -207,10 +216,9 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
       diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => { await progress("Inspecting current changes"); return git(worktree.root, ["diff", "HEAD"], signal); } }),
       run_checks: tool({ description: "Run the configured test or verification command", inputSchema: z.object({ focused: z.boolean() }), execute: async ({ focused }) => runCheck(focused) }),
       run_setup: tool({ description: "Run the project's configured setup command after changing dependencies", inputSchema: z.object({}), execute: async () => {
-        if (!job.commands.setup) return "No setup command is configured.";
-        await progress("Running the configured setup command");
-        const result = await command(worktree.root, job.commands.setup, signal);
-        if (result.code) throw new Error(failedCommand("The configured setup command failed", result));
+        await progress("Installing project dependencies");
+        const result = await command(worktree.root, await dependencyCommand(worktree.root, job.commands.setup), signal);
+        if (result.code) throw new Error(failedCommand("The setup command failed", result));
         return result.text || "Setup completed.";
       } }),
       finish_work: tool({ description: "Finish repository work, or stop with a concrete blocker that needs human direction", inputSchema: z.object({ status: z.enum(["ready", "blocked"]), reason: z.string().optional() }), execute: async ({ status, reason }) => {
