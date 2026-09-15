@@ -1,55 +1,30 @@
-import { exec as execCallback, execFile as execFileCallback } from "node:child_process";
-import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
-import { generateText, Output, stepCountIs, tool } from "ai";
+import { generateText, hasToolCall, Output, tool } from "ai";
 import { z } from "zod";
 import { CheckLog } from "./checks.js";
 import { languageModel } from "./providers.js";
-import { implementationSchema, reviewSchema, type AgentReport, type Job, type Result, type Setup } from "./protocol.js";
+import { implementationSchema, resultSchema, reviewSchema, type AgentReport, type Job, type Result, type Setup } from "./protocol.js";
 
-const exec = promisify(execCallback);
-const execFile = promisify(execFileCallback);
 type CommandResult = { code: number; text: string };
+
+export class ExecutionFailure extends Error {
+  constructor(message: string, readonly checkpoint?: string) { super(message); }
+}
 
 export function failedCommand(label: string, result: CommandResult) {
   const prefix = `${label} (exit ${result.code}).`;
-  const available = 500 - prefix.length - 2;
-  return result.text.trim() ? `${prefix}\n\n${result.text.trim().slice(-available)}` : prefix;
+  return result.text.trim() ? `${prefix}\n\n${result.text.trim()}` : prefix;
 }
 
 export function repairPrompt(result: CommandResult) {
   return `Continue working on the current repository change. Full project verification failed with exit ${result.code}. Inspect and fix the cause, then run the checks again before finishing.\n\n${result.text}`;
 }
 
-export async function dependencyInstallCommand(root: string) {
-  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as { packageManager?: unknown };
-  const manager = typeof manifest.packageManager === "string" ? manifest.packageManager.split("@")[0] : "npm";
-  return ["npm", "pnpm", "yarn", "bun"].includes(manager) ? `${manager} install` : "npm install";
-}
-
-export async function verificationCommand(root: string, configured: string) {
-  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as { scripts?: Record<string, unknown> };
-  const extras = ["typecheck", "test:integration"]
-    .filter((name) => typeof manifest.scripts?.[name] === "string" && !configured.includes(`run ${name}`))
-    .map((name) => `npm run ${name}`);
-  return [configured, ...extras].join(" && ");
-}
-
 export function requiresGreenBaseline(job: Pick<Job, "execution" | "baseCommit" | "headCommit">) {
   return job.execution === "implementation" && job.baseCommit === job.headCommit;
-}
-
-export function createInactivitySignal(delay = 5 * 60 * 1000) {
-  const controller = new AbortController();
-  let timer: NodeJS.Timeout;
-  const touch = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), delay);
-  };
-  touch();
-  return { signal: controller.signal, touch, stop: () => clearTimeout(timer) };
 }
 
 export function repositoryFromRemote(remote: string) {
@@ -64,21 +39,25 @@ export function safeCodePath(value: string) {
   return value;
 }
 
-async function git(cwd: string, args: string[]) {
-  try {
-    const result = await execFile("git", args, { cwd, timeout: 120_000, maxBuffer: 20_000_000 });
-    return `${result.stdout}\n${result.stderr}`.trim();
-  } catch { throw new Error(`Git could not ${args[0]}.`); }
+function run(cwd: string, program: string, args: string[], signal?: AbortSignal, shell = false): Promise<CommandResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { cwd, shell, signal });
+    let text = "";
+    child.stdout?.on("data", (chunk) => { text += chunk; });
+    child.stderr?.on("data", (chunk) => { text += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code: code ?? 1, text: text.trim() }));
+  });
 }
 
-async function command(cwd: string, value: string): Promise<CommandResult> {
-  try {
-    const result = await exec(value, { cwd, timeout: 120_000, maxBuffer: 20_000_000 });
-    return { code: 0, text: `${result.stdout}\n${result.stderr}`.trim().slice(-20_000) };
-  } catch (error) {
-    const failure = error as { code?: number; stdout?: string; stderr?: string };
-    return { code: typeof failure.code === "number" ? failure.code : 1, text: `${failure.stdout ?? ""}\n${failure.stderr ?? ""}`.trim().slice(-20_000) };
-  }
+async function git(cwd: string, args: string[], signal?: AbortSignal) {
+  const result = await run(cwd, "git", args, signal);
+  if (result.code) throw new Error(failedCommand(`Git ${args.join(" ")} failed`, result));
+  return result.text;
+}
+
+function command(cwd: string, value: string, signal?: AbortSignal) {
+  return run(cwd, value, [], signal, true);
 }
 
 async function repositoryRoot(sourceDirectory: string, expectedRepository: string) {
@@ -116,13 +95,21 @@ async function scaffoldJavaScriptProject(root: string, repository: string) {
 export async function verifyLocalProject(sourceDirectory: string, setup: Setup) {
   const root = await repositoryRoot(sourceDirectory, setup.repository);
   if (!await hasJavaScriptProject(root)) await scaffoldJavaScriptProject(root, setup.repository);
-  if (setup.commands.setup) {
-    const installation = await command(root, setup.commands.setup);
-    if (installation.code) throw new Error("The setup command failed.");
+  const temporary = await mkdtemp(path.join(tmpdir(), "dev-pipeline-ready-"));
+  const workspace = path.join(temporary, "repository");
+  await git(root, ["worktree", "add", "--detach", workspace, "HEAD"]);
+  try {
+    if (setup.commands.setup) {
+      const installation = await command(workspace, setup.commands.setup);
+      if (installation.code) throw new Error(failedCommand("The setup command failed", installation));
+    }
+    const verification = await command(workspace, setup.commands.verify);
+    if (verification.code) throw new Error(failedCommand("The verification command failed", verification));
+    return verification;
+  } finally {
+    await git(root, ["worktree", "remove", "--force", workspace]).catch(() => {});
+    await rm(temporary, { recursive: true, force: true });
   }
-  const verification = await command(root, await verificationCommand(root, setup.commands.verify));
-  if (verification.code) throw new Error("The verification command failed.");
-  return verification;
 }
 
 async function safeLocalPath(root: string, relative: string) {
@@ -140,12 +127,12 @@ async function safeLocalPath(root: string, relative: string) {
   return filename;
 }
 
-async function checkout(sourceDirectory: string, job: Job) {
+async function checkout(sourceDirectory: string, job: Job, signal?: AbortSignal) {
   const root = await repositoryRoot(sourceDirectory, job.repository);
-  await git(root, ["fetch", "origin", `refs/heads/${job.branch}:refs/remotes/origin/${job.branch}`]);
+  await git(root, ["fetch", "origin", `refs/heads/${job.branch}:refs/remotes/origin/${job.branch}`], signal);
   const temporary = await mkdtemp(path.join(tmpdir(), "dev-pipeline-"));
   const workspace = path.join(temporary, "repository");
-  await git(root, ["worktree", "add", "--detach", workspace, job.headCommit]);
+  await git(root, ["worktree", "add", "--detach", workspace, job.headCommit], signal);
   if ((await git(workspace, ["rev-parse", "HEAD"])).trim() !== job.headCommit) {
     await git(root, ["worktree", "remove", "--force", workspace]).catch(() => {});
     await rm(temporary, { recursive: true, force: true });
@@ -157,23 +144,38 @@ async function checkout(sourceDirectory: string, job: Job) {
   } };
 }
 
-export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (progress: string) => Promise<void>): Promise<Result> {
+export async function preserveChanges(root: string, job: Pick<Job, "id" | "branch" | "headCommit">, signal?: AbortSignal) {
+  const changed = await git(root, ["status", "--porcelain"], signal);
+  let commit = (await git(root, ["rev-parse", "HEAD"], signal)).trim();
+  if (!changed && commit === job.headCommit) return undefined;
+  if (changed) {
+    await git(root, ["add", "-A"], signal);
+    const names = (await git(root, ["diff", "--cached", "--name-only"], signal)).split("\n").filter(Boolean);
+    for (const name of names) await safeLocalPath(root, name);
+    await git(root, ["-c", "user.name=Dev Pipeline", "-c", "user.email=dev-pipeline@localhost", "commit", "-m", `checkpoint: ${job.id}`], signal);
+    commit = (await git(root, ["rev-parse", "HEAD"], signal)).trim();
+  }
+  await git(root, ["push", "origin", `HEAD:refs/heads/${job.branch}`], signal);
+  return commit;
+}
+
+export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (progress: string, activity?: string) => Promise<void>, signal?: AbortSignal): Promise<Result> {
   await heartbeat("Preparing the local checkout");
-  const worktree = await checkout(sourceDirectory, job);
-  const inactivity = createInactivitySignal();
-  const progress = async (message: string) => { inactivity.touch(); await heartbeat(message); };
+  const worktree = await checkout(sourceDirectory, job, signal);
+  const progress = (message: string, activity?: string) => heartbeat(message, activity);
+  let removeWorktree = true;
   try {
     if (job.commands.setup) {
       await progress("Installing project dependencies");
-      const setup = await command(worktree.root, job.commands.setup);
-      if (setup.code) throw new Error("The configured setup command failed.");
+      const setup = await command(worktree.root, job.commands.setup, signal);
+      if (setup.code) throw new Error(failedCommand("The configured setup command failed", setup));
     }
-    const verify = async () => command(worktree.root, await verificationCommand(worktree.root, job.commands.verify));
+    const verify = () => command(worktree.root, job.commands.verify, signal);
     if (job.action === "merge") {
       await progress("Running full verification before merge");
       const verification = await verify();
-      if (verification.code) throw new Error("Full verification failed. The reviewed change was not merged.");
-      if (await git(worktree.root, ["status", "--porcelain"])) throw new Error("Setup or verification changed the checkout.");
+      if (verification.code) throw new Error(failedCommand("Full verification failed; the reviewed change was not merged", verification));
+      if (await git(worktree.root, ["status", "--porcelain"], signal)) throw new Error("Setup or verification changed the checkout.");
       return { execution: "merge", commit: job.headCommit, verification };
     }
     if (!job.ai || !job.execution || !job.system || !job.prompt) throw new Error("The repository job is incomplete.");
@@ -184,95 +186,134 @@ export async function executeJob(job: Job, sourceDirectory: string, heartbeat: (
     if (baseline.code) await progress("Repairing the existing pipeline change");
     const readonly = job.execution === "review";
     const checks = new CheckLog();
-    let dependenciesChanged = false;
-    const installDependencies = async () => {
-      if (!dependenciesChanged) return;
-      await progress("Installing changed dependencies");
-      const installation = await command(worktree.root, await dependencyInstallCommand(worktree.root));
-      if (installation.code) throw new Error(failedCommand("Dependency installation failed", installation));
-      dependenciesChanged = false;
-    };
+    let blocker: string | undefined;
     const runCheck = async (focused: boolean) => {
-      await installDependencies();
       await progress(focused ? "Running focused tests" : "Running full verification");
-      const selected = focused && job.commands.test ? job.commands.test : await verificationCommand(worktree.root, job.commands.verify);
-      const result = await command(worktree.root, selected);
+      const selected = focused && job.commands.test ? job.commands.test : job.commands.verify;
+      const result = await command(worktree.root, selected, signal);
       checks.checked(selected, result);
       await progress(`${focused ? "Focused tests" : "Full verification"} ${result.code === 0 ? "passed" : "failed"}`);
       return result;
     };
     const tools = {
-      delivery_diff: tool({ description: "Inspect committed application changes from the work unit base to its current head", inputSchema: z.object({}), execute: async () => { await progress("Inspecting the committed change"); return (await git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"])).slice(-100_000); } }),
-      list_files: tool({ description: "List repository files", inputSchema: z.object({}), execute: async () => { await progress("Listing repository files"); return (await git(worktree.root, ["ls-files"])).split("\n").filter((file) => { try { safeCodePath(file); return !file.startsWith("specs/"); } catch { return false; } }).slice(0, 2000).join("\n"); } }),
+      delivery_diff: tool({ description: "Inspect committed application changes from the work unit base to its current head", inputSchema: z.object({}), execute: async () => { await progress("Inspecting the committed change"); return git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"], signal); } }),
+      list_files: tool({ description: "List repository files", inputSchema: z.object({}), execute: async () => { await progress("Listing repository files"); return (await git(worktree.root, ["ls-files"], signal)).split("\n").filter((file) => { try { safeCodePath(file); return !file.startsWith("specs/"); } catch { return false; } }).join("\n"); } }),
       read_file: tool({ description: "Read a relevant text file", inputSchema: z.object({ path: z.string() }), execute: async ({ path: relative }) => {
         await progress(`Reading ${relative}`);
         const data = await readFile(await safeLocalPath(worktree.root, relative));
-        if (data.length > 100_000 || data.includes(0)) throw new Error("Read text files under 100 KB.");
+        if (data.includes(0)) throw new Error("Only text files can be read.");
         return data.toString("utf8");
       } }),
-      diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => { await progress("Inspecting current changes"); return (await git(worktree.root, ["diff", "HEAD"])).slice(-100_000); } }),
+      diff: tool({ description: "Show current uncommitted changes", inputSchema: z.object({}), execute: async () => { await progress("Inspecting current changes"); return git(worktree.root, ["diff", "HEAD"], signal); } }),
       run_checks: tool({ description: "Run the configured test or verification command", inputSchema: z.object({ focused: z.boolean() }), execute: async ({ focused }) => runCheck(focused) }),
+      run_setup: tool({ description: "Run the project's configured setup command after changing dependencies", inputSchema: z.object({}), execute: async () => {
+        if (!job.commands.setup) return "No setup command is configured.";
+        await progress("Running the configured setup command");
+        const result = await command(worktree.root, job.commands.setup, signal);
+        if (result.code) throw new Error(failedCommand("The configured setup command failed", result));
+        return result.text || "Setup completed.";
+      } }),
+      finish_work: tool({ description: "Finish repository work, or stop with a concrete blocker that needs human direction", inputSchema: z.object({ status: z.enum(["ready", "blocked"]), reason: z.string().optional() }), execute: async ({ status, reason }) => {
+        blocker = status === "blocked" ? reason || "The agent needs human direction before it can continue." : undefined;
+        return status === "blocked" ? "Work stopped for human direction." : "Work finished.";
+      } }),
       ...(!readonly ? {
-        write_file: tool({ description: "Write a changed text file and classify the edit", inputSchema: z.object({ path: z.string(), kind: z.enum(["test", "implementation", "refactor"]), content: z.string().max(100_000) }), execute: async ({ path: relative, kind, content }) => {
+        write_file: tool({ description: "Write a changed text file and classify the edit", inputSchema: z.object({ path: z.string(), kind: z.enum(["test", "implementation", "refactor"]), content: z.string() }), execute: async ({ path: relative, kind, content }) => {
           await progress(`${kind === "test" ? "Writing test" : kind === "implementation" ? "Writing code" : "Refining code"}: ${relative}`);
           const filename = await safeLocalPath(worktree.root, relative);
           await mkdir(path.dirname(filename), { recursive: true });
           await writeFile(filename, content, "utf8");
-          if (relative === "package.json") dependenciesChanged = true;
           return "Saved.";
+        } }),
+        delete_file: tool({ description: "Delete an obsolete repository file", inputSchema: z.object({ path: z.string() }), execute: async ({ path: relative }) => {
+          await progress(`Deleting obsolete file: ${relative}`);
+          await rm(await safeLocalPath(worktree.root, relative));
+          return "Deleted.";
+        } }),
+        move_file: tool({ description: "Move or rename a repository file", inputSchema: z.object({ from: z.string(), to: z.string() }), execute: async ({ from, to }) => {
+          await progress(`Moving ${from} to ${to}`);
+          const source = await safeLocalPath(worktree.root, from);
+          const destination = await safeLocalPath(worktree.root, to);
+          await mkdir(path.dirname(destination), { recursive: true });
+          await rename(source, destination);
+          return "Moved.";
         } }),
       } : {}),
     };
     const schema: z.ZodType<AgentReport> = job.execution === "implementation" ? implementationSchema : reviewSchema;
     await progress(job.execution === "implementation" ? "Planning the first test-first change" : "Reviewing the implementation");
-    const work = async (prompt: string) => generateText({ model: languageModel(ai), system: job.system, prompt, tools, stopWhen: stepCountIs(60), abortSignal: inactivity.signal });
+    const work = async (prompt: string) => {
+      blocker = undefined;
+      const response = await generateText({
+        model: languageModel(ai), system: job.system, prompt, tools,
+        stopWhen: hasToolCall("finish_work"), abortSignal: signal,
+        onStepFinish: async ({ text }) => { if (text.trim()) await progress("Agent response", text.trim()); },
+      });
+      if (blocker) throw new Error(blocker);
+      return response;
+    };
     let agentNotes = (await work(`${job.prompt}\n\n# Unchanged baseline\nExit: ${baseline.code}\n${baseline.text}\n\nWork on the repository with the available tools. Do not prepare the final report yet.`)).text;
     let finalCommand = "";
     let verification: CommandResult = baseline;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      await installDependencies();
-      await progress(attempt ? "Re-running full verification" : "Running final verification");
-      finalCommand = await verificationCommand(worktree.root, job.commands.verify);
-      verification = await command(worktree.root, finalCommand);
+    for (;;) {
+      await progress("Running final verification");
+      finalCommand = job.commands.verify;
+      verification = await command(worktree.root, finalCommand, signal);
       checks.checked(finalCommand, verification);
       await progress(`Final verification ${verification.code === 0 ? "passed" : "failed"}`);
-      if (!verification.code) break;
-      if (readonly || attempt === 2) throw new Error(failedCommand("Full verification failed; the change was not published", verification));
+      if (!verification.code || readonly) break;
       await progress("Repairing the failed verification");
-      const diff = (await git(worktree.root, ["diff", "HEAD"])).slice(-60_000);
+      const diff = await git(worktree.root, ["diff", "HEAD"], signal);
       const repair = await work(`${job.prompt}\n\n${repairPrompt(verification)}\n\n# Current change\n${diff}`);
-      agentNotes = `${agentNotes}\n\n${repair.text}`.slice(-20_000);
+      agentNotes = `${agentNotes}\n\n${repair.text}`;
     }
     const evidence = readonly ? "" : checks.finish();
     await progress("Preparing the verified report");
     const diff = readonly
-      ? (await git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"])).slice(-60_000)
-      : (await git(worktree.root, ["diff", "HEAD"])).slice(-60_000);
+      ? await git(worktree.root, ["diff", `${job.baseCommit}...${job.headCommit}`, "--", ".", ":(exclude)specs/**"], signal)
+      : `${await git(worktree.root, ["diff", `${job.baseCommit}...HEAD`, "--", ".", ":(exclude)specs/**"], signal)}\n${await git(worktree.root, ["diff", "HEAD"], signal)}`.trim();
     const summary = await generateText({
       model: languageModel(ai),
       system: job.system,
-      prompt: `${job.prompt}\n\nThe repository work is complete and final verification passed. Return only the required structured ${job.execution} report from the evidence below. Do not perform more repository work.\n\n# Agent notes\n${agentNotes}\n\n# Change\n${diff}\n\n# Final verification\nCommand: ${finalCommand}\nExit: ${verification.code}\n${verification.text}\n\n${evidence ? `# Check evidence\n${evidence}` : ""}`,
+      prompt: `${job.prompt}\n\nThe repository work is complete${verification.code ? " with failing verification" : " and final verification passed"}. Return only the required structured ${job.execution} report from the evidence below. Do not perform more repository work.\n\n# Agent notes\n${agentNotes}\n\n# Change\n${diff}\n\n# Final verification\nCommand: ${finalCommand}\nExit: ${verification.code}\n${verification.text}\n\n${evidence ? `# Check evidence\n${evidence}` : ""}`,
       output: Output.object({ schema }),
-      abortSignal: inactivity.signal,
+      abortSignal: signal,
+      onStepFinish: async ({ text }) => { if (text.trim()) await progress("Preparing the report", text.trim()); },
     });
-    const report = summary.output;
+    const report = readonly && verification.code && summary.output.kind === "review" && summary.output.recommendation === "Accept"
+      ? { ...summary.output, recommendation: "Revise" as const }
+      : summary.output;
     if (report.kind !== job.execution) throw new Error("The model returned the wrong execution report.");
     if (readonly) {
-      if (await git(worktree.root, ["status", "--porcelain"])) throw new Error("Review changed the checkout.");
+      if (await git(worktree.root, ["status", "--porcelain"], signal)) throw new Error("Review changed the checkout.");
       return { execution: "review", commit: job.headCommit, report: reviewSchema.parse(report), verification };
     }
     await progress("Preparing the verified commit");
-    await git(worktree.root, ["add", "-A"]);
-    const names = (await git(worktree.root, ["diff", "--cached", "--name-only"])).split("\n").filter(Boolean);
-    if (!names.length) throw new Error("No repository changes were produced.");
+    await git(worktree.root, ["add", "-A"], signal);
+    const names = (await git(worktree.root, ["diff", "--cached", "--name-only"], signal)).split("\n").filter(Boolean);
+    if (!names.length) {
+      if (job.headCommit === job.baseCommit) throw new Error("No repository changes were produced.");
+      return resultSchema.parse({ execution: "implementation", commit: job.headCommit, report: implementationSchema.parse(report), evidence, verification });
+    }
     for (const name of names) await safeLocalPath(worktree.root, name);
-    await git(worktree.root, ["-c", "user.name=Dev Pipeline", "-c", "user.email=dev-pipeline@localhost", "commit", "-m", `implementation: ${job.id}`]);
-    const commit = (await git(worktree.root, ["rev-parse", "HEAD"])).trim();
+    await git(worktree.root, ["-c", "user.name=Dev Pipeline", "-c", "user.email=dev-pipeline@localhost", "commit", "-m", `implementation: ${job.id}`], signal);
+    const commit = (await git(worktree.root, ["rev-parse", "HEAD"], signal)).trim();
+    const result = resultSchema.parse({ execution: "implementation", commit, report: implementationSchema.parse(report), evidence, verification });
     await progress("Pushing the verified work branch");
-    await git(worktree.root, ["push", "origin", `HEAD:refs/heads/${job.branch}`]);
-    return { execution: "implementation", commit, report: implementationSchema.parse(report), evidence, verification };
+    await git(worktree.root, ["push", "origin", `HEAD:refs/heads/${job.branch}`], signal);
+    return result;
+  } catch (error) {
+    if (job.execution !== "implementation") throw error;
+    try {
+      const saved = await preserveChanges(worktree.root, job);
+      if (!saved) throw error;
+      throw new ExecutionFailure(`${error instanceof Error ? error.message : "Implementation failed."}\n\nUnverified work was preserved on ${job.branch} at ${saved}.`, saved);
+    } catch (checkpointError) {
+      if (checkpointError instanceof ExecutionFailure || checkpointError === error) throw checkpointError;
+      removeWorktree = false;
+      throw new ExecutionFailure(`${error instanceof Error ? error.message : "Implementation failed."}\n\nThe checkpoint could not be pushed. The generated files remain at ${worktree.root}.\n${checkpointError instanceof Error ? checkpointError.message : checkpointError}`);
+    }
   } finally {
-    inactivity.stop();
-    await worktree.cleanup();
+    if (removeWorktree) await worktree.cleanup();
   }
 }

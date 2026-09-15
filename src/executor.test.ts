@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createInactivitySignal, dependencyInstallCommand, failedCommand, repairPrompt, repositoryFromRemote, requiresGreenBaseline, safeCodePath, verificationCommand, verifyLocalProject } from "./executor.js";
+import { failedCommand, preserveChanges, repairPrompt, repositoryFromRemote, requiresGreenBaseline, safeCodePath, verifyLocalProject } from "./executor.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -15,44 +15,12 @@ test("recognises GitHub repository remotes", () => {
   assert.equal(repositoryFromRemote("https://example.com/alexvernikov/example.git"), null);
 });
 
-test("activity extends execution while inactivity aborts it", async () => {
-  const timeout = createInactivitySignal(40);
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  timeout.touch();
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(timeout.signal.aborted, false);
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(timeout.signal.aborted, true);
-  timeout.stop();
-});
-
-test("selects the repository package manager for changed dependencies", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
-  try {
-    await writeFile(path.join(directory, "package.json"), '{"packageManager":"pnpm@10.0.0"}\n');
-    assert.equal(await dependencyInstallCommand(directory), "pnpm install");
-    await writeFile(path.join(directory, "package.json"), "{}\n");
-    assert.equal(await dependencyInstallCommand(directory), "npm install");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("failed commands retain concise verification evidence", () => {
-  const message = failedCommand("Full verification failed", { code: 127, text: "sh: vitest: command not found" });
+test("failed commands retain complete verification evidence", () => {
+  const evidence = `first relevant line\n${"x".repeat(600)}\nlast relevant line`;
+  const message = failedCommand("Full verification failed", { code: 127, text: evidence });
   assert.match(message, /exit 127/);
-  assert.match(message, /vitest: command not found/);
-  assert.ok(message.length <= 500);
-});
-
-test("full verification includes checks declared by generated projects", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
-  try {
-    await writeFile(path.join(directory, "package.json"), JSON.stringify({ scripts: { test: "node --test", build: "tsc", typecheck: "tsc --noEmit", "test:integration": "vitest run" } }));
-    assert.equal(await verificationCommand(directory, "npm test && npm run build"), "npm test && npm run build && npm run typecheck && npm run test:integration");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
+  assert.match(message, /first relevant line/);
+  assert.match(message, /last relevant line/);
 });
 
 test("only a first implementation requires a green starting branch", () => {
@@ -79,11 +47,58 @@ test("verifies a JavaScript project in the expected repository", async () => {
     await execFile("git", ["init"], { cwd: directory });
     await execFile("git", ["remote", "add", "origin", "git@github.com:alexvernikov/example.git"], { cwd: directory });
     await writeFile(path.join(directory, "package.json"), "{}\n");
+    await execFile("git", ["add", "."], { cwd: directory });
+    await execFile("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: directory });
     const result = await verifyLocalProject(directory, { repository: "alexvernikov/example", commands: { setup: "", verify: "node -e \"process.exit(0)\"" } });
     assert.equal(result.code, 0);
     await assert.rejects(() => verifyLocalProject(directory, { repository: "someone/else", commands: { setup: "", verify: "node -e \"process.exit(0)\"" } }), /not someone\/else/);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("project readiness commands cannot dirty the selected checkout", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
+  try {
+    await execFile("git", ["init"], { cwd: directory });
+    await execFile("git", ["remote", "add", "origin", "git@github.com:alexvernikov/example.git"], { cwd: directory });
+    await writeFile(path.join(directory, "package.json"), "{}\n");
+    await execFile("git", ["add", "."], { cwd: directory });
+    await execFile("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: directory });
+
+    await verifyLocalProject(directory, {
+      repository: "alexvernikov/example",
+      commands: { setup: "node -e \"require('fs').writeFileSync('generated.txt', 'temporary')\"", verify: "node -e \"process.exit(0)\"" },
+    });
+
+    await assert.rejects(readFile(path.join(directory, "generated.txt")), { code: "ENOENT" });
+    assert.equal((await execFile("git", ["status", "--porcelain"], { cwd: directory })).stdout, "");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed work is preserved on its work branch", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-test-"));
+  const remote = await mkdtemp(path.join(tmpdir(), "dev-pipeline-local-remote-"));
+  try {
+    await execFile("git", ["init", "--bare"], { cwd: remote });
+    await execFile("git", ["init"], { cwd: directory });
+    await execFile("git", ["remote", "add", "origin", remote], { cwd: directory });
+    await writeFile(path.join(directory, "package.json"), "{}\n");
+    await execFile("git", ["add", "."], { cwd: directory });
+    await execFile("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: directory });
+    const head = (await execFile("git", ["rev-parse", "HEAD"], { cwd: directory })).stdout.trim();
+    await execFile("git", ["push", "origin", `HEAD:refs/heads/work/test`], { cwd: directory });
+    await writeFile(path.join(directory, "generated.ts"), "export const generated = true;\n");
+
+    const checkpoint = await preserveChanges(directory, { id: "job_test", branch: "work/test", headCommit: head });
+
+    assert.ok(checkpoint);
+    assert.equal((await execFile("git", ["--git-dir", remote, "show", "work/test:generated.ts"])).stdout, "export const generated = true;\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    await rm(remote, { recursive: true, force: true });
   }
 });
 

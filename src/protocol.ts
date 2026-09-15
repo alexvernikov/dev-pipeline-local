@@ -16,7 +16,7 @@ export const reviewSchema = z.object({
   recommendation: z.enum(["Accept", "Revise", "Escalate"]),
 });
 
-const commandResultSchema = z.object({ code: z.number().int(), text: z.string().max(20_000) });
+const commandResultSchema = z.object({ code: z.number().int(), text: z.string() });
 
 export const setupSchema = z.object({
   repository: z.string().regex(/^[^/]+\/[^/]+$/),
@@ -38,7 +38,7 @@ export const jobSchema = z.object({
 });
 
 export const resultSchema = z.discriminatedUnion("execution", [
-  z.object({ execution: z.literal("implementation"), commit: z.string(), report: implementationSchema, evidence: z.string().max(100_000), verification: commandResultSchema }),
+  z.object({ execution: z.literal("implementation"), commit: z.string(), report: implementationSchema, evidence: z.string(), verification: commandResultSchema }),
   z.object({ execution: z.literal("review"), commit: z.string(), report: reviewSchema, verification: commandResultSchema }),
   z.object({ execution: z.literal("merge"), commit: z.string(), verification: commandResultSchema }),
 ]);

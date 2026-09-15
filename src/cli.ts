@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
-import { executeJob, verifyLocalProject } from "./executor.js";
+import { executeJob, ExecutionFailure, verifyLocalProject } from "./executor.js";
 import { jobSchema, setupSchema, type Result } from "./protocol.js";
 
 function option(name: string) {
@@ -34,7 +34,14 @@ function openBrowser(target: string) {
 
 function safeFailure(error: unknown) {
   const message = error instanceof Error ? error.message : "Local repository execution failed.";
-  return message.length <= 500 && !/token|api.?key|authorization/i.test(message) ? message : "Local repository execution failed. Check this terminal for details.";
+  return message
+    .replace(/(authorization:\s*bearer\s+)\S+/gi, "$1[redacted]")
+    .replace(/(api[_ -]?key\s*[=:]\s*)\S+/gi, "$1[redacted]");
+}
+
+class TaskCancelled extends Error {}
+class ReportRejected extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
 }
 
 async function pair() {
@@ -54,7 +61,20 @@ async function pair() {
 
 async function report(token: string, body: object) {
   const result = await request("/api/runner", body, token);
-  if (!result.response.ok) throw new Error(result.data?.error ?? `The pipeline rejected the result (${result.response.status}).`);
+  if (result.response.status === 409 && result.data?.active === false) return false;
+  if (!result.response.ok) throw new ReportRejected(result.response.status, result.data?.error ?? `The pipeline rejected the result (${result.response.status}).`);
+  return true;
+}
+
+async function reportEventually(token: string, body: object) {
+  for (;;) {
+    try { return await report(token, body); }
+    catch (error) {
+      if (error instanceof ReportRejected && error.status < 500) throw error;
+      console.error("Could not reach the pipeline to save the task result. Retrying…");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
 }
 
 async function verifySetup(token: string) {
@@ -90,17 +110,25 @@ async function run() {
     const job = jobSchema.parse(next.data);
     console.log(`Working on ${job.branch}…`);
     let progress = "Preparing the local checkout";
-    const pulse = setInterval(() => void report(token, { action: "heartbeat", jobId: job.id, progress }).catch(() => {}), 15_000);
+    const cancellation = new AbortController();
+    const pulse = setInterval(() => void report(token, { action: "heartbeat", jobId: job.id, progress }).then((active) => {
+      if (!active) cancellation.abort();
+    }).catch(() => {}), 15_000);
+    let completed: Result | undefined;
     try {
-      const result: Result = await executeJob(job, directory, (message) => {
+      completed = await executeJob(job, directory, async (message, activity) => {
         progress = message;
-        return report(token, { action: "heartbeat", jobId: job.id, progress });
-      });
-      await report(token, { action: "completed", jobId: job.id, result });
-      console.log(`Finished ${job.branch} at ${result.commit.slice(0, 8)}.`);
+        if (!await report(token, { action: "heartbeat", jobId: job.id, progress, ...(activity ? { activity } : {}) })) {
+          cancellation.abort();
+          throw new TaskCancelled("Task cancelled.");
+        }
+      }, cancellation.signal);
+      if (!await reportEventually(token, { action: "completed", jobId: job.id, result: completed })) throw new TaskCancelled("Task cancelled.");
+      console.log(`Finished ${job.branch} at ${completed.commit.slice(0, 8)}.`);
     } catch (error) {
       console.error(error);
-      await report(token, { action: "failed", jobId: job.id, error: safeFailure(error) });
+      const checkpoint = error instanceof ExecutionFailure ? error.checkpoint : completed?.execution === "implementation" ? completed.commit : undefined;
+      await reportEventually(token, { action: "failed", jobId: job.id, error: cancellation.signal.aborted ? "Cancelled by a project participant." : safeFailure(error), ...(checkpoint ? { checkpoint } : {}) });
     } finally {
       clearInterval(pulse);
     }
