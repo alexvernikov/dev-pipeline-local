@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { executeJob, ExecutionFailure, verifyLocalProject } from "./executor.js";
 import { jobSchema, setupSchema, type Result } from "./protocol.js";
 
@@ -25,6 +26,18 @@ async function request(path: string, body?: object, token?: string) {
   });
   const data = response.status === 204 ? null : await response.json().catch(() => null);
   return { response, data };
+}
+
+export async function retryConnection<T>(attempt: () => Promise<T>, wait: () => Promise<void> = () => new Promise((resolve) => setTimeout(resolve, 2000))) {
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof TypeError) && (!(error instanceof DOMException) || !["AbortError", "TimeoutError"].includes(error.name))) throw error;
+      console.error("Connection interrupted. Retrying…");
+      await wait();
+    }
+  }
 }
 
 function openBrowser(target: string) {
@@ -97,7 +110,7 @@ async function run() {
   await verifySetup(token);
   console.log("Connected. Leave this terminal open while Dev Pipeline is working.");
   for (;;) {
-    const next = await request("/api/runner", undefined, token);
+    const next = await retryConnection(() => request("/api/runner", undefined, token));
     if (next.response.status === 204) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       continue;
@@ -135,7 +148,9 @@ async function run() {
   }
 }
 
-run().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}
