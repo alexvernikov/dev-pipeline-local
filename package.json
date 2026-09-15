@@ -9,6 +9,7 @@
   "files": [
     "dist/checks.js",
     "dist/cli.js",
+    "dist/connection.js",
     "dist/executor.js",
     "dist/protocol.js",
     "dist/providers.js"
